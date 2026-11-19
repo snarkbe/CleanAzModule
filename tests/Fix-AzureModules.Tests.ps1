@@ -96,7 +96,7 @@ Describe 'Get-TargetModuleDirectory' {
     }
 
     It 'ignores roots that do not exist, are empty or null' {
-        $result = Get-TargetModuleDirectory -Path @((Join-Path $TestDrive 'missing'), '', $null, $script:Root)
+        $result = @(Get-TargetModuleDirectory -Path @((Join-Path $TestDrive 'missing'), '', $null, $script:Root))
         $result.Count | Should -Be 3
     }
 
@@ -162,7 +162,7 @@ Describe 'Get-LoadedTargetModule' {
                 [pscustomobject]@{ Name = 'AzureAD' }
             )
         }
-        $loaded = Get-LoadedTargetModule
+        $loaded = @(Get-LoadedTargetModule)
         $loaded.Count | Should -Be 1
         $loaded[0].Name | Should -Be 'Az.Accounts'
     }
