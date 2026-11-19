@@ -106,6 +106,32 @@ Describe 'Get-TargetModuleDirectory' {
     }
 }
 
+Describe 'Test-IsLink' {
+    It 'is false for a plain folder' {
+        Test-IsLink -Item ([pscustomobject]@{ Attributes = [IO.FileAttributes]::Directory; LinkType = $null }) |
+            Should -BeFalse
+    }
+
+    It 'is false for a OneDrive Files On-Demand folder (reparse point, but no link)' {
+        $attributes = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint
+        Test-IsLink -Item ([pscustomobject]@{ Attributes = $attributes; LinkType = $null }) |
+            Should -BeFalse
+    }
+
+    It 'is true for a junction and a symbolic link' {
+        $attributes = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint
+        Test-IsLink -Item ([pscustomobject]@{ Attributes = $attributes; LinkType = 'Junction' }) |
+            Should -BeTrue
+        Test-IsLink -Item ([pscustomobject]@{ Attributes = $attributes; LinkType = 'SymbolicLink' }) |
+            Should -BeTrue
+    }
+
+    It 'is true for a reparse point whose link type cannot be read' {
+        $attributes = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint
+        Test-IsLink -Item ([pscustomobject]@{ Attributes = $attributes }) | Should -BeTrue
+    }
+}
+
 Describe 'Remove-TargetModuleDirectory' {
     BeforeEach {
         $script:Root = Join-Path $TestDrive ([guid]::NewGuid().ToString())

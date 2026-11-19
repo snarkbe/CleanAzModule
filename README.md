@@ -73,7 +73,11 @@ script does not change or bypass your execution policy.
 - **MSI installations.** If Azure PowerShell was installed with the MSI package, the
   script removes its files and tells you to also uninstall it from "Installed apps".
 - **Links and junctions** among the module folders are skipped and reported, never
-  followed.
+  followed. OneDrive "Files On-Demand" folders are not links and are removed normally.
+- **Documents in OneDrive.** If your Documents folder is synced by OneDrive, your
+  current-user modules live there, and deleting them also deletes them from OneDrive on
+  every PC that syncs that folder. Installing with `-Scope AllUsers` (the default) keeps
+  the new Az out of OneDrive.
 
 ## Requirements
 

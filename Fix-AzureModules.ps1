@@ -141,6 +141,21 @@ function Get-TargetModuleDirectory {
     return @($found)
 }
 
+function Test-IsLink {
+    <#
+        True for symbolic links and junctions: they point somewhere else and must not be
+        followed. OneDrive "Files On-Demand" folders are reparse points as well, but they
+        are ordinary folders and return false.
+    #>
+    [OutputType([bool])]
+    param([Parameter(Mandatory)]$Item)
+    if (-not ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+    $linkType = $Item.PSObject.Properties['LinkType']
+    # No LinkType at all should not happen on 5.1+; stay on the safe side if it does.
+    if (-not $linkType) { return $true }
+    return [bool]$linkType.Value
+}
+
 function Remove-TargetModuleDirectory {
     <#
         Deletes the given folders. Returns one message per folder that could not be removed.
@@ -152,7 +167,7 @@ function Remove-TargetModuleDirectory {
     param([System.IO.DirectoryInfo[]]$Directory)
     $failures = New-Object System.Collections.Generic.List[string]
     foreach ($dir in $Directory) {
-        if ($dir.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (Test-IsLink -Item $dir) {
             $failures.Add("Skipped $($dir.FullName): it is a link or junction. Remove it manually.")
             continue
         }
