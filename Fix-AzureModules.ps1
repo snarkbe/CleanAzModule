@@ -244,7 +244,7 @@ if (-not (Test-IsAdministrator)) {
     }
 }
 
-$loaded = Get-LoadedTargetModule
+$loaded = @(Get-LoadedTargetModule)
 if ($loaded.Count -gt 0) {
     $names = ($loaded | Select-Object -ExpandProperty Name | Sort-Object -Unique) -join ', '
     Write-Step "Azure modules are loaded in this session: $names" Yellow
@@ -278,26 +278,30 @@ if (-not $SkipInstall) {
     $findArgs = @{ Name = 'Az'; Repository = $Repository; ErrorAction = 'Stop' }
     if ($RequiredVersion) { $findArgs['RequiredVersion'] = $RequiredVersion.ToString() }
     try {
+        # Read-only lookup: run it outside -WhatIf, which would otherwise make the
+        # PowerShellGet module print noise while it loads.
+        $WhatIfPreference = $false
         $available = Find-Module @findArgs
     } catch {
         Write-Step "Cannot find Az in $Repository : $($_.Exception.Message)" Red
         Write-Step 'Nothing was changed. Check the network / repository and try again.' Red
         exit 1
     }
+    $WhatIfPreference = $preview
     Write-Step "Az $($available.Version) will be installed (scope: $Scope)."
 }
 
 # 2. What will be removed.
-$directories = Get-TargetModuleDirectory -Path (Get-ModuleRoot)
+$directories = @(Get-TargetModuleDirectory -Path (Get-ModuleRoot))
 Write-Step "$($directories.Count) Az / AzureRM module folder(s) found."
 
-$msi = Get-AzMsiInstallation
+$msi = @(Get-AzMsiInstallation)
 if ($msi.Count -gt 0) {
     Write-Step 'Azure PowerShell is also installed with the MSI package. Uninstall it from' Yellow
     Write-Step '"Installed apps" as well, otherwise Windows keeps listing it.' Yellow
 }
 
-$others = Get-OtherPowerShellProcess
+$others = @(Get-OtherPowerShellProcess)
 if ($directories.Count -gt 0 -and $others.Count -gt 0) {
     $list = ($others | ForEach-Object { "$($_.ProcessName) ($($_.Id))" }) -join ', '
     Write-Step "Other PowerShell processes are running: $list" Yellow
@@ -367,6 +371,6 @@ if ($failures.Count -gt 0) {
 if ($installed) {
     Write-Step "[$elapsed] Done. Az $($installed.Version) is installed; older Az / AzureRM modules were removed." Green
 } else {
-    Write-Step "[$elapsed] Done. Az / AzureRM modules were removed." Green
+    Write-Step "[$elapsed] Done. No Az / AzureRM module is left in the standard module folders." Green
 }
 exit 0
