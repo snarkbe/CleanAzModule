@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.shell }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install PSScriptAnalyzer and Pester
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -Scope CurrentUser -Force
+          Install-Module -Name Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Lint
+        run: |
+          $issues = Invoke-ScriptAnalyzer -Path . -Recurse
+          $issues | Format-Table RuleName, Severity, ScriptName, Line, Message -Wrap
+          if ($issues) { exit 1 }
+
+      - name: Unit tests
+        run: |
+          Import-Module Pester -RequiredVersion 5.7.1
+          $result = Invoke-Pester -Path tests -PassThru -Output Detailed
+          if ($result.FailedCount -gt 0) { exit 1 }
+
+      # Runs the real script on Windows without changing anything.
+      - name: Smoke test (-WhatIf)
+        run: |
+          & .\Fix-AzureModules.ps1 -WhatIf
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

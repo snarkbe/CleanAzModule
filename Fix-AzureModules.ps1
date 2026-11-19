@@ -1,137 +1,391 @@
-# Re-launch in a clean session without profile to avoid loading Az modules that would lock DLLs
-if (-not $env:FIX_AZ_NOPROFILE) {
-    Write-Host "Relaunching in a clean -NoProfile session..." -ForegroundColor Magenta
-    $pwsh = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh' } else { 'powershell' }
-    $env:FIX_AZ_NOPROFILE = '1'
-    & $pwsh -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath
-    $env:FIX_AZ_NOPROFILE = $null
-    exit $LASTEXITCODE
-}
+<#
+.SYNOPSIS
+    Removes every installed Az / AzureRM PowerShell module and reinstalls a clean Az.
 
-$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-$errorList = [System.Collections.Generic.List[string]]::new()
-function Write-Step {
-    param([string]$Step, [string]$Message)
-    $elapsed = $stopwatch.Elapsed.ToString("mm\:ss")
-    Write-Host "[$elapsed] [$Step] $Message" -ForegroundColor Cyan
-}
+.DESCRIPTION
+    Fixes a broken Azure PowerShell installation (version conflicts, stale or duplicate
+    versions, Import-Module failures) by wiping the Az and AzureRM module folders from the
+    standard module locations of Windows PowerShell 5.1 and PowerShell 7, then installing
+    Az again from the PowerShell Gallery.
 
-# 1. Kill processes that could lock modules
-Write-Step "1/5" "Stopping Azure-related processes..."
-$procs = Get-Process | Where-Object { $_.Name -like "*Azure*" -or $_.Name -like "*Az.*" }
-if ($procs) {
-    Write-Step "1/5" "$($procs.Count) process(es) found - stopping..."
-    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
-} else {
-    Write-Step "1/5" "No Azure processes running."
-}
-Write-Step "1/5" "Done."
+    Nothing is deleted before the script has checked that it runs elevated, that no Az
+    module is loaded in the current session, and that the Az module can be reached in the
+    repository. Use -WhatIf to see what would be removed without changing anything.
 
-# 2. Uninstall via PowerShellGet (AllUsers and CurrentUser scopes)
-# Use Get-InstalledModule to find ALL registered versions (Get-Module -ListAvailable only shows the highest)
-Write-Step "2/5" "Retrieving list of installed Az/AzureRM modules (all versions)..."
-$moduleNames = Get-InstalledModule -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -eq "Az" -or $_.Name -like "Az.*" -or $_.Name -like "AzureRM*" } |
-    Select-Object -ExpandProperty Name -Unique
-Write-Step "2/5" "$($moduleNames.Count) module(s) found to uninstall."
+    The script exits with code 0 on success and 1 if anything failed.
 
-$i = 0
-foreach ($name in $moduleNames) {
-    $i++
-    Write-Step "2/5" "[$i/$($moduleNames.Count)] Uninstalling all versions of $name..."
-    try {
-        Uninstall-Module -Name $name -AllVersions -Force -ErrorAction Stop
-    } catch {
-        $msg = "Failed to uninstall $name : $($_.Exception.Message)"
-        Write-Host "  [WARN] $msg" -ForegroundColor Yellow
-        $errorList.Add($msg)
-    }
-}
-Write-Step "2/5" "Software uninstall complete."
+.PARAMETER Scope
+    Where Az is reinstalled: AllUsers (default) or CurrentUser. The cleanup always covers
+    both the machine-wide and the current user's module folders.
 
-# 3. Force-delete module folders from disk (hard cleanup)
-Write-Step "3/5" "Force-cleaning module directories on disk..."
-$modulePaths = @(
-    "$env:ProgramFiles\WindowsPowerShell\Modules",
-    "$env:ProgramFiles\PowerShell\7\Modules",
-    "$env:SystemRoot\system32\WindowsPowerShell\v1.0\Modules",
-    "$env:USERPROFILE\Documents\WindowsPowerShell\Modules",
-    "$env:AppData\Roaming\Modules"
+.PARAMETER RequiredVersion
+    Install this exact version of Az instead of the latest one.
+
+.PARAMETER Repository
+    Name of the registered repository to install Az from. Defaults to PSGallery.
+
+.PARAMETER SkipInstall
+    Only remove the modules; do not reinstall Az.
+
+.PARAMETER Force
+    Do not ask for confirmation before removing the modules. Required in non-interactive
+    sessions.
+
+.EXAMPLE
+    .\Fix-AzureModules.ps1 -WhatIf
+
+    Lists the module folders that would be removed. Changes nothing.
+
+.EXAMPLE
+    .\Fix-AzureModules.ps1
+
+    Asks for confirmation, removes all Az / AzureRM modules and installs the latest Az for
+    all users.
+
+.EXAMPLE
+    pwsh -NoProfile -File .\Fix-AzureModules.ps1 -Force -RequiredVersion 14.0.0
+
+    Unattended run from a clean session, pinned to Az 14.0.0.
+
+.NOTES
+    Windows only. Must be run from an elevated session.
+    Run it with -NoProfile if your profile imports Az modules: a session that has loaded
+    them keeps their files locked.
+
+.LINK
+    https://github.com/snarkbe/CleanAzModule
+#>
+
+#Requires -Version 5.1
+
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [ValidateSet('AllUsers', 'CurrentUser')]
+    [string]$Scope = 'AllUsers',
+
+    [version]$RequiredVersion,
+
+    [ValidateNotNullOrEmpty()]
+    [string]$Repository = 'PSGallery',
+
+    [switch]$SkipInstall,
+
+    [switch]$Force
 )
 
-foreach ($path in $modulePaths) {
-    if (Test-Path $path) {
-        Write-Step "3/5" "Scanning $path..."
-        # Also target the "Az" folder (no dot) - not matched by "Az.*"
-        $azDirs = Get-ChildItem -Path $path -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -eq "Az" -or $_.Name -like "Az.*" }
-        $azrmDirs = Get-ChildItem -Path $path -Filter "AzureRM*" -Directory -ErrorAction SilentlyContinue
-        $total = @($azDirs).Count + @($azrmDirs).Count
-        if ($total -gt 0) {
-            Write-Step "3/5" "  -> $total folder(s) found, deleting..."
-            foreach ($dir in @($azDirs) + @($azrmDirs)) {
+function Write-Step {
+    # Console progress for an interactive tool; Write-Host is intended here.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Interactive console output')]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Message,
+        [ConsoleColor]$Color = [ConsoleColor]::Cyan
+    )
+    Write-Host $Message -ForegroundColor $Color
+}
+
+function Test-IsWindowsPlatform {
+    [OutputType([bool])]
+    param()
+    return [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+}
+
+function Test-IsAdministrator {
+    [OutputType([bool])]
+    param()
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-TargetModuleName {
+    <# True for Az, Az.*, AzureRM and AzureRM.* - and nothing else (not AzureAD, AzSK...). #>
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Name)
+    return ($Name -eq 'Az' -or $Name -like 'Az.*' -or $Name -eq 'AzureRM' -or $Name -like 'AzureRM.*')
+}
+
+function Get-ModuleRoot {
+    <# Standard module folders of Windows PowerShell 5.1 and PowerShell 7, machine and user. #>
+    [OutputType([string[]])]
+    param(
+        [string]$ProgramFiles = $env:ProgramFiles,
+        [string]$ProgramFilesX86 = ${env:ProgramFiles(x86)},
+        # Resolved through the shell so a Documents folder redirected to OneDrive is found.
+        [string]$Documents = [Environment]::GetFolderPath('MyDocuments')
+    )
+    $roots = New-Object System.Collections.Generic.List[string]
+    foreach ($base in @($ProgramFiles, $ProgramFilesX86)) {
+        if ($base) {
+            $roots.Add((Join-Path $base 'WindowsPowerShell\Modules'))
+            $roots.Add((Join-Path $base 'PowerShell\Modules'))
+            $roots.Add((Join-Path $base 'PowerShell\7\Modules'))
+        }
+    }
+    if ($Documents) {
+        $roots.Add((Join-Path $Documents 'WindowsPowerShell\Modules'))
+        $roots.Add((Join-Path $Documents 'PowerShell\Modules'))
+    }
+    return @($roots | Select-Object -Unique)
+}
+
+function Get-TargetModuleDirectory {
+    <# Az / AzureRM module folders found directly under the given module roots. #>
+    [OutputType([System.IO.DirectoryInfo[]])]
+    param([string[]]$Path)
+    $found = foreach ($root in $Path) {
+        if ($root -and (Test-Path -LiteralPath $root -PathType Container)) {
+            Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue |
+                Where-Object { Test-TargetModuleName -Name $_.Name }
+        }
+    }
+    return @($found)
+}
+
+function Test-IsLink {
+    <#
+        True for symbolic links and junctions: they point somewhere else and must not be
+        followed. OneDrive "Files On-Demand" folders are reparse points as well, but they
+        are ordinary folders and return false.
+    #>
+    [OutputType([bool])]
+    param([Parameter(Mandatory)]$Item)
+    if (-not ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+    $linkType = $Item.PSObject.Properties['LinkType']
+    # No LinkType at all should not happen on 5.1+; stay on the safe side if it does.
+    if (-not $linkType) { return $true }
+    return [bool]$linkType.Value
+}
+
+function Remove-TargetModuleDirectory {
+    <#
+        Deletes the given folders. Returns one message per folder that could not be removed.
+        Links and junctions are left alone: following one could delete files outside the
+        module folders.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([string[]])]
+    param([System.IO.DirectoryInfo[]]$Directory)
+    $failures = New-Object System.Collections.Generic.List[string]
+    foreach ($dir in $Directory) {
+        if (Test-IsLink -Item $dir) {
+            $failures.Add("Skipped $($dir.FullName): it is a link or junction. Remove it manually.")
+            continue
+        }
+        if ($PSCmdlet.ShouldProcess($dir.FullName, 'Remove module folder')) {
+            try {
+                Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction Stop
+            } catch {
+                $failures.Add("Failed to delete $($dir.FullName): $($_.Exception.Message)")
+            }
+        }
+    }
+    return $failures.ToArray()
+}
+
+function Get-LoadedTargetModule {
+    <# Az / AzureRM modules imported in the current session (their files are locked). #>
+    param()
+    return @(Get-Module | Where-Object { Test-TargetModuleName -Name $_.Name })
+}
+
+function Get-OtherPowerShellProcess {
+    <# Other PowerShell hosts; any of them may have Az loaded and keep its files locked. #>
+    param()
+    return @(Get-Process -Name 'powershell', 'pwsh', 'powershell_ise' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Id -ne $PID })
+}
+
+function Get-AzMsiInstallation {
+    <# Az installed with the MSI package is registered in Windows; report it if present. #>
+    param()
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    return @(Get-ItemProperty -Path $keys -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSObject.Properties['DisplayName'] -and $_.DisplayName -like 'Microsoft Azure PowerShell*' })
+}
+
+function Install-AzModule {
+    <# Installs Az. Throws if the installation fails. #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$Scope,
+        [Parameter(Mandatory)][string]$Repository,
+        [version]$RequiredVersion
+    )
+    $installArgs = @{
+        Name         = 'Az'
+        Scope        = $Scope
+        Repository   = $Repository
+        AllowClobber = $true
+        Force        = $true
+        ErrorAction  = 'Stop'
+    }
+    $label = 'Az (latest)'
+    if ($RequiredVersion) {
+        $installArgs['RequiredVersion'] = $RequiredVersion.ToString()
+        $label = "Az $RequiredVersion"
+    }
+    if ($PSCmdlet.ShouldProcess("$label from $Repository, scope $Scope", 'Install module')) {
+        Install-Module @installArgs
+    }
+}
+
+# Dot-sourcing loads the functions only (used by the tests).
+if ($MyInvocation.InvocationName -eq '.') { return }
+
+# --------------------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------------------
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$failures = New-Object System.Collections.Generic.List[string]
+$preview = [bool]$WhatIfPreference
+
+# 1. Preconditions - nothing is modified before all of them pass.
+if (-not (Test-IsWindowsPlatform)) {
+    Write-Step 'This script only supports Windows.' Red
+    exit 1
+}
+
+if (-not (Test-IsAdministrator)) {
+    if ($preview) {
+        Write-Step 'Not elevated: fine for -WhatIf, but the real run needs an elevated session.' Yellow
+    } else {
+        Write-Step 'This script must be run as Administrator. Nothing was changed.' Red
+        exit 1
+    }
+}
+
+$loaded = @(Get-LoadedTargetModule)
+if ($loaded.Count -gt 0) {
+    $names = ($loaded | Select-Object -ExpandProperty Name | Sort-Object -Unique) -join ', '
+    Write-Step "Azure modules are loaded in this session: $names" Yellow
+    if (-not $preview) {
+        Write-Step 'Their files are locked and cannot be removed. Nothing was changed.' Red
+        Write-Step 'Close this session and run the script from a clean one:' Red
+        Write-Step '    powershell -NoProfile -File .\Fix-AzureModules.ps1    (or pwsh)' Red
+        exit 1
+    }
+}
+
+if (-not $SkipInstall) {
+    if ($PSVersionTable.PSEdition -ne 'Core') {
+        # Windows PowerShell 5.1 does not always negotiate TLS 1.2, which the Gallery requires.
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
+            if ($PSCmdlet.ShouldProcess('NuGet package provider', 'Install')) {
+                Write-Step 'Installing the NuGet package provider...'
                 try {
-                    Remove-Item -Path $dir.FullName -Recurse -Force -ErrorAction Stop
+                    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction Stop | Out-Null
                 } catch {
-                    $msg = "Failed to delete $($dir.FullName) : $($_.Exception.Message)"
-                    Write-Host "  [WARN] $msg" -ForegroundColor Yellow
-                    $errorList.Add($msg)
+                    Write-Step "Could not install the NuGet package provider: $($_.Exception.Message)" Red
+                    Write-Step 'Nothing was changed.' Red
+                    exit 1
                 }
             }
-        } else {
-            Write-Step "3/5" "  -> Nothing to delete."
-        }
-    } else {
-        Write-Step "3/5" "Path not found, skipping: $path"
-    }
-}
-Write-Step "3/5" "Disk cleanup complete."
-
-# 4. Clean reinstall (AllUsers scope)
-Write-Step "4/5" "Configuring TLS 1.2..."
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-# Install-PackageProvider for NuGet is broken in PowerShell 7+; update PowerShellGet instead
-Write-Step "4/5" "Updating PowerShellGet..."
-Install-Module -Name PowerShellGet -Force -AllowClobber -Scope AllUsers -ErrorAction SilentlyContinue
-
-Write-Step "4/5" "Installing Az module (AllUsers) - this may take several minutes..."
-Install-Module -Name Az -AllowClobber -Scope AllUsers -Force
-
-# 5. Remove old versions, keep only the latest of each module
-Write-Step "5/5" "Cleaning up old module versions..."
-$azModules = Get-InstalledModule -Name "Az*" -ErrorAction SilentlyContinue
-$grouped = $azModules | Group-Object Name
-foreach ($group in $grouped) {
-    if ($group.Count -gt 1) {
-        $latest = $group.Group | Sort-Object Version -Descending | Select-Object -First 1
-        $old = $group.Group | Sort-Object Version -Descending | Select-Object -Skip 1
-        foreach ($oldMod in $old) {
-            Write-Step "5/5" "Removing $($oldMod.Name) v$($oldMod.Version) (keeping v$($latest.Version))..."
-            try {
-                Uninstall-Module -Name $oldMod.Name -RequiredVersion $oldMod.Version -Force -ErrorAction Stop
-            } catch {
-                $msg = "Failed to remove old $($oldMod.Name) v$($oldMod.Version) : $($_.Exception.Message)"
-                Write-Host "  [WARN] $msg" -ForegroundColor Yellow
-                $errorList.Add($msg)
-            }
         }
     }
-}
-Write-Step "5/5" "Old version cleanup complete."
 
+    Write-Step "Checking that Az is available in $Repository..."
+    $findArgs = @{ Name = 'Az'; Repository = $Repository; ErrorAction = 'Stop' }
+    if ($RequiredVersion) { $findArgs['RequiredVersion'] = $RequiredVersion.ToString() }
+    try {
+        # Read-only lookup: run it outside -WhatIf, which would otherwise make the
+        # PowerShellGet module print noise while it loads.
+        $WhatIfPreference = $false
+        $available = Find-Module @findArgs
+    } catch {
+        Write-Step "Cannot find Az in $Repository : $($_.Exception.Message)" Red
+        Write-Step 'Nothing was changed. Check the network / repository and try again.' Red
+        exit 1
+    }
+    $WhatIfPreference = $preview
+    Write-Step "Az $($available.Version) will be installed (scope: $Scope)."
+}
+
+# 2. What will be removed.
+$directories = @(Get-TargetModuleDirectory -Path (Get-ModuleRoot))
+Write-Step "$($directories.Count) Az / AzureRM module folder(s) found."
+
+$msi = @(Get-AzMsiInstallation)
+if ($msi.Count -gt 0) {
+    Write-Step 'Azure PowerShell is also installed with the MSI package. Uninstall it from' Yellow
+    Write-Step '"Installed apps" as well, otherwise Windows keeps listing it.' Yellow
+}
+
+$others = @(Get-OtherPowerShellProcess)
+if ($directories.Count -gt 0 -and $others.Count -gt 0) {
+    $list = ($others | ForEach-Object { "$($_.ProcessName) ($($_.Id))" }) -join ', '
+    Write-Step "Other PowerShell processes are running: $list" Yellow
+    Write-Step 'If one of them has loaded Az, some files will be locked. Close them first' Yellow
+    Write-Step '(VS Code terminals included) for a complete cleanup.' Yellow
+}
+
+# 3. Confirmation.
+if ($directories.Count -gt 0 -and -not $preview -and -not $Force) {
+    $question = "Delete $($directories.Count) Az / AzureRM module folder(s)"
+    if ($SkipInstall) { $question += '?' } else { $question += ' and reinstall Az?' }
+    try {
+        $confirmed = $PSCmdlet.ShouldContinue($question, 'Fix-AzureModules')
+    } catch {
+        Write-Step 'Cannot ask for confirmation in a non-interactive session. Use -Force. Nothing was changed.' Red
+        exit 1
+    }
+    if (-not $confirmed) {
+        Write-Step 'Cancelled. Nothing was changed.' Yellow
+        exit 0
+    }
+}
+
+# 4. Removal.
+if ($directories.Count -gt 0) {
+    Write-Step 'Removing module folders...'
+    foreach ($message in @(Remove-TargetModuleDirectory -Directory $directories)) {
+        Write-Step "  [WARN] $message" Yellow
+        $failures.Add($message)
+    }
+}
+
+# 5. Reinstall. Done even if some folders could not be removed: leaving the machine
+#    without Az would be worse than leaving an old version next to the new one.
+$installed = $null
+if (-not $SkipInstall) {
+    Write-Step 'Installing Az - this may take several minutes...'
+    try {
+        Install-AzModule -Scope $Scope -Repository $Repository -RequiredVersion $RequiredVersion
+        if (-not $preview) {
+            $installed = Get-Module -ListAvailable -Name Az | Sort-Object Version -Descending | Select-Object -First 1
+            if (-not $installed) { throw 'Install-Module reported no error, but Az cannot be found afterwards.' }
+        }
+    } catch {
+        $message = "Az was NOT installed: $($_.Exception.Message)"
+        Write-Step "  [ERROR] $message" Red
+        $failures.Add($message)
+    }
+}
+
+# 6. Summary.
 $stopwatch.Stop()
-$total = $stopwatch.Elapsed.ToString("mm\:ss")
-Write-Host ""
-if ($errorList.Count -gt 0) {
-    Write-Host "[$total] Completed with $($errorList.Count) warning(s):" -ForegroundColor Yellow
-    foreach ($err in $errorList) {
-        Write-Host "  - $err" -ForegroundColor Yellow
-    }
-    Write-Host ""
-    Write-Host "Some old module versions may still be on disk. Try:" -ForegroundColor Yellow
-    Write-Host "  1. Close ALL PowerShell/VS Code/Azure sessions" -ForegroundColor Yellow
-    Write-Host "  2. Run this script again as Administrator" -ForegroundColor Yellow
-} else {
-    Write-Host "[$total] Done! System is clean and Azure PowerShell has been reinstalled." -ForegroundColor Green
+$elapsed = $stopwatch.Elapsed.ToString('mm\:ss')
+Write-Step ''
+if ($preview) {
+    Write-Step "[$elapsed] Preview only (-WhatIf). Nothing was changed." Green
+    exit 0
 }
+if ($failures.Count -gt 0) {
+    Write-Step "[$elapsed] Finished with $($failures.Count) problem(s):" Yellow
+    foreach ($failure in $failures) { Write-Step "  - $failure" Yellow }
+    Write-Step ''
+    Write-Step 'Close every PowerShell / VS Code / Azure session, then run the script again' Yellow
+    Write-Step 'from a clean elevated session (-NoProfile).' Yellow
+    exit 1
+}
+if ($installed) {
+    Write-Step "[$elapsed] Done. Az $($installed.Version) is installed; older Az / AzureRM modules were removed." Green
+} else {
+    Write-Step "[$elapsed] Done. No Az / AzureRM module is left in the standard module folders." Green
+}
+exit 0
